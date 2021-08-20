@@ -2,12 +2,14 @@ package uptimerobotapi
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/hashicorp/terraform-plugin-sdk/helper/logging"
 )
 
 func New(apiKey string) UptimeRobotApiClient {
@@ -26,39 +28,71 @@ func (client UptimeRobotApiClient) MakeCall(
 
 	url := "https://api.uptimerobot.com/v2/" + endpoint
 
-	payload := strings.NewReader(
-		fmt.Sprintf("api_key=%s&format=json&%s", client.apiKey, params),
-	)
+	c := &http.Client{
+		Transport: &http.Transport{},
+	}
 
-	req, _ := http.NewRequest("POST", url, payload)
+	c.Transport = logging.NewTransport("UptimeRobot", c.Transport)
 
-	req.Header.Add("cache-control", "no-cache")
-	req.Header.Add("content-type", "application/x-www-form-urlencoded")
+	var res *http.Response
 
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
+	payload := fmt.Sprintf("api_key=%s&format=json&%s", client.apiKey, params)
+
+	for {
+		req, err := http.NewRequest("POST", url, strings.NewReader(payload))
+		if err != nil {
+			return nil, fmt.Errorf("contructing request: %w", err)
+		}
+
+		req.Header.Add("cache-control", "no-cache")
+		req.Header.Add("content-type", "application/x-www-form-urlencoded")
+
+		resCandidate, err := c.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("performing API request: %w", err)
+		}
+
+		switch resCandidate.StatusCode {
+		case http.StatusTooManyRequests:
+			waitForRetryAfter(resCandidate)
+		default:
+			res = resCandidate
+			break
+		}
 	}
 
 	defer res.Body.Close()
 	body, err := ioutil.ReadAll(res.Body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("reading response body: %w", err)
 	}
 
-	log.Printf("[DEBUG] Got response: %#v", res)
-	log.Printf("[DEBUG] Got body: %#v", string(body))
-
-	// fmt.Printf("Got response: %#v\n", res)
-	// fmt.Printf("Got body: %#v\n", string(body))
-
 	var result map[string]interface{}
-	json.Unmarshal([]byte(body), &result)
+	if err := json.Unmarshal([]byte(body), &result); err != nil {
+		return nil, fmt.Errorf("decoding response body %q: %w", string(body), err)
+	}
 
 	if result["stat"] != "ok" {
 		message, _ := json.Marshal(result["error"])
-		return nil, errors.New("Got error from UptimeRobot: " + string(message))
+		return nil, fmt.Errorf("got error from UptimeRobot: %s", string(message))
 	}
 
 	return result, nil
+}
+
+func waitForRetryAfter(res *http.Response) {
+	retryAfterRaws, ok := res.Header["Retry-After"]
+	if !ok || len(retryAfterRaws) > 1 {
+		log.Printf("[DEBUG] Retry-After header is missing, waiting 1 second for next request attempt")
+		retryAfterRaws = []string{"1"}
+	}
+
+	waitTime, err := time.ParseDuration(retryAfterRaws[0] + "s")
+	if err != nil {
+		log.Printf("[DEBUG] Parsing %q as Retry-After header value in seconds, waiting 1 second for next request: %v", retryAfterRaws, err)
+		waitTime = time.Second
+	}
+
+	log.Printf("[DEBUG] Rate limit exceeded, waiting %d seconds to send next request", waitTime.Seconds())
+	time.Sleep(waitTime)
 }
